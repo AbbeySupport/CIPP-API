@@ -682,7 +682,33 @@ namespace CIPP
             HttpResponseMessage response;
             try
             {
-                response = await client.SendAsync(request, token).ConfigureAwait(false);
+                // ResponseHeadersRead: do NOT buffer the body inside SendAsync. With the
+                // default (ResponseContentRead) the body is downloaded and auto-decompressed
+                // here, so a mislabeled Content-Encoding (EXO error responses declare gzip on
+                // a plain body) throws InvalidDataException from SendAsync and bypasses the
+                // defensive body read below — masking the HTTP status the caller needs.
+                response = await client.SendAsync(request, HttpCompletionOption.ResponseHeadersRead, token).ConfigureAwait(false);
+            }
+            catch (OperationCanceledException) when (cts is not null && cts.IsCancellationRequested)
+            {
+                // Our per-request timeout CTS actually fired — this is a genuine
+                // client-side timeout after timeoutSec. Let it propagate as an
+                // OperationCanceledException so the PowerShell wrapper reports it
+                // as a timeout (and the "timed out after {timeoutSec}s" message is true).
+                TrackTransportError(selection.Pool);
+                throw;
+            }
+            catch (OperationCanceledException ex)
+            {
+                // Cancellation was NOT triggered by our timeout token. The server
+                // reset/closed the request before our timeout elapsed — common for
+                // slow EXO InvokeCommand cmdlets (Search-UnifiedAuditLog,
+                // Get-MessageTraceV2) which the service cuts off well under 100s.
+                // Surface it as a transport error so it is not mislabeled as a
+                // client timeout and is correctly treated as a retryable failure.
+                TrackTransportError(selection.Pool);
+                throw new HttpRequestException(
+                    $"The request to '{uri}' was canceled by the server before completing.", ex);
             }
             catch
             {
